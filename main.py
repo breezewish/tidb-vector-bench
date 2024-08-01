@@ -6,10 +6,13 @@ import numpy
 import peewee
 import pymysql
 import tabulate
+import subprocess
 
 
 def exit_print_usage():
-    print("Usage: python bench.py <local|dev|staging|production> <load|test>")
+    print(
+        "Usage: python bench.py <local|dev|staging|production> <load|test|clean|connect>"
+    )
     sys.exit(1)
 
 
@@ -103,13 +106,15 @@ class Sample(peewee.Model):
     )
 
 
-print(
-    f"+ Connecting to {mysql_db.connect_params['user']}@{mysql_db.connect_params['host']}..."
-)
-mysql_db.connect()
+def connect():
+    print(
+        f"+ Connecting to {mysql_db.connect_params['user']}@{mysql_db.connect_params['host']}..."
+    )
+    mysql_db.connect()
 
 
 def run_load():
+    connect()
     print("+ Creating tables...")
     mysql_db.create_tables([Sample])
 
@@ -125,6 +130,7 @@ def run_load():
 
 
 def run_test():
+    connect()
     print("+ Reading TIFLASH_INDEXES...")
     cursor = mysql_db.execute_sql(
         f"SELECT ROWS_STABLE_INDEXED, ROWS_STABLE_NOT_INDEXED, ROWS_DELTA_NOT_INDEXED FROM INFORMATION_SCHEMA.TIFLASH_INDEXES WHERE TIDB_TABLE='sample'"
@@ -167,9 +173,26 @@ def run_test():
 
 
 def run_clean():
+    connect()
     print("+ Dropping tables...")
     mysql_db.drop_tables([Sample])
     print("+ Done")
+
+
+def run_connect():
+    subprocess.run(
+        [
+            "mysql",
+            "-h",
+            mysql_db.connect_params["host"],
+            "-P",
+            str(mysql_db.connect_params["port"]),
+            "-u",
+            mysql_db.connect_params["user"],
+            f'-p{mysql_db.connect_params["passwd"]}',
+        ],
+        check=True,
+    )
 
 
 if action == "load":
@@ -178,5 +201,7 @@ elif action == "test":
     run_test()
 elif action == "clean":
     run_clean()
+elif action == "connect":
+    run_connect()
 else:
     exit_print_usage()
