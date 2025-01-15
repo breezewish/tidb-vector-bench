@@ -7,11 +7,14 @@ import peewee
 import pymysql
 import tabulate
 import subprocess
+from tidb_vector.peewee import VectorField, VectorAdaptor
+from tidb_vector.utils import encode_vector
+import tidb_vector
 
 
 def exit_print_usage():
     print(
-        "Usage: python bench.py <local|dev|staging|production> <load|test|clean|connect>"
+        "Usage: python main.py <local|dev|staging|production> <load|test|clean|connect>"
     )
     sys.exit(1)
 
@@ -70,25 +73,6 @@ else:
     exit_print_usage()
 
 
-def format_vec(value: numpy.ndarray):
-    return numpy.array2string(
-        value,
-        max_line_width=999999999999,
-        separator=",",
-        formatter={"float_kind": lambda x: "%.1f" % x},
-    )
-
-
-class VectorField(peewee.Field):
-    field_type = "VECTOR(784)"
-
-    def db_value(self, value):
-        return format_vec(value)
-
-    def python_value(self, value):
-        return value
-
-
 class UnsignedIntegerField(peewee.IntegerField):
     field_type = "int unsigned"
 
@@ -101,9 +85,7 @@ class Sample(peewee.Model):
     id = UnsignedIntegerField(
         # primary_key=True,
     )
-    vec = VectorField(
-        constraints=[peewee.SQL("COMMENT 'hnsw(distance=l2)'")],
-    )
+    vec = VectorField(784)
 
 
 def connect():
@@ -117,6 +99,9 @@ def run_load():
     connect()
     print("+ Creating tables...")
     mysql_db.create_tables([Sample])
+    VectorAdaptor(mysql_db).create_vector_index(
+        Sample.vec, tidb_vector.DistanceMetric.L2, skip_existing=True
+    )
 
     with h5py.File("./fashion-mnist-784-euclidean.hdf5", "r") as data_file:
         data: numpy.ndarray = data_file["train"][()]
@@ -133,12 +118,17 @@ def run_test():
     connect()
     print("+ Reading TIFLASH_INDEXES...")
     cursor = mysql_db.execute_sql(
-        f"SELECT ROWS_STABLE_INDEXED, ROWS_STABLE_NOT_INDEXED, ROWS_DELTA_NOT_INDEXED FROM INFORMATION_SCHEMA.TIFLASH_INDEXES WHERE TIDB_TABLE='sample'"
+        f"SELECT ROWS_STABLE_INDEXED, ROWS_STABLE_NOT_INDEXED, ROWS_DELTA_INDEXED, ROWS_DELTA_NOT_INDEXED FROM INFORMATION_SCHEMA.TIFLASH_INDEXES WHERE TIDB_TABLE='sample'"
     )
     print(
         tabulate.tabulate(
             cursor.fetchall(),
-            headers=["Indexed", "NotIndexed", "Delta"],
+            headers=[
+                "StableIndexed",
+                "StableNotIndexed",
+                "DeltaIndexed",
+                "DeltaNotIndexed",
+            ],
             tablefmt="psql",
         )
     )
@@ -153,7 +143,7 @@ def run_test():
         # First query: select id, to calculate a recall rate.
         with mysql_db.execute_sql(
             "SELECT id FROM sample ORDER BY VEC_L2_Distance(vec, %s) LIMIT 100",
-            (format_vec(query_row),),
+            (encode_vector(query_row),),
         ) as cursor:
             actual_results = cursor.fetchall()
             actual_results_set = set([int(row[0]) for row in actual_results])
@@ -166,8 +156,8 @@ def run_test():
 
         # Second query: Use EXPLAIN ANALYZE to check the (hot cache) performance.
         with mysql_db.execute_sql(
-            "EXPLAIN ANALYZE SELECT id, VEC_L2_Distance(vec, %s) AS d FROM sample ORDER BY d LIMIT 100",
-            (format_vec(query_row),),
+            "EXPLAIN ANALYZE SELECT id FROM sample ORDER BY VEC_L2_Distance(vec, %s) LIMIT 100",
+            (encode_vector(query_row),),
         ) as cursor:
             print(tabulate.tabulate(cursor.fetchall(), tablefmt="psql"))
 
